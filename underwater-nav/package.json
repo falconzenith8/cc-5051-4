@@ -1,0 +1,16 @@
+{
+  "name": "underwater-nav",
+  "version": "1.0.0",
+  "description": "3D underwater vehicle navigation: volumetric A* planning with swept-volume collision verification",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/selftest.js"
+  },
+  "dependencies": {
+    "three": "0.160.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.65.1"
+  }
+}
