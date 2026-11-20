@@ -185,6 +185,163 @@ export function boxSurfacePoints(center, yaw, half, stepMax) {
   return [...set.values()];
 }
 
+// ---------------------------------------------------------------------------
+// EXACT oriented vehicle-box vs analytic primitive clearance.
+//
+// The oriented box is the vehicle at (center, yaw). For each obstacle we return
+// d <= 0 exactly when the two solids intersect, and a positive value otherwise.
+// For disjoint convex pairs this is a true (linearised) minimum distance, and for
+// overlapping pairs a penetration depth; the box-vs-box value can be the minimum
+// over the separating-axes' overlaps, so it is always a LOWER bound on the
+// distance to the obstacle surface — never an over-estimate. That direction of
+// error is the safe one: the planner rejects at most a few extra poses, it never
+// accepts one that the dense surface sampling (geometry sdf) would find inside.
+//
+// This replaces the probe-based pose test at the authoritative checkpoints.
+// It is smooth in yaw, so a committed heading is evaluated honestly instead of
+// being silently satisfied by "some other yaw fits".
+// ---------------------------------------------------------------------------
+
+// Reply-frame axes of a yaw rotation about Z (unit vectors, world XY).
+function yawAxes(yaw) {
+  const c = Math.cos(yaw), s = Math.sin(yaw);
+  return [[c, s], [-s, c]];
+}
+
+export function obstacleClearance(o, center, yaw, half) {
+  const [u0, u1] = yawAxes(yaw);
+  const C = center;
+  if (o.type === 'box') {
+    const [v0, v1] = yawAxes(o.yaw || 0);
+    const dx = C[0] - o.center[0], dy = C[1] - o.center[1];
+    let minOverlap = Infinity;
+    let maxGap = -Infinity;
+    // Four candidate separating axes in the horizontal plane: two vehicle
+    // face normals and two obstacle face normals (rotated-box SAT in 2D).
+    for (const n of [u0, u1, v0, v1]) {
+      const proj = Math.abs(dx * n[0] + dy * n[1]);
+      const rv = half[0] * Math.abs(u0[0] * n[0] + u0[1] * n[1])
+        + half[1] * Math.abs(u1[0] * n[0] + u1[1] * n[1]);
+      const ro = o.half[0] * Math.abs(v0[0] * n[0] + v0[1] * n[1])
+        + o.half[1] * Math.abs(v1[0] * n[0] + v1[1] * n[1]);
+      const overlap = rv + ro - proj;
+      if (overlap < minOverlap) minOverlap = overlap;
+      if (overlap < 0 && -overlap > maxGap) maxGap = -overlap;
+    }
+    // Vertical interval (both boxes are z-aligned).
+    const overlapZ = half[2] + o.half[2] - Math.abs(C[2] - o.center[2]);
+    if (overlapZ < minOverlap) minOverlap = overlapZ;
+    if (overlapZ < 0 && -overlapZ > maxGap) maxGap = -overlapZ;
+    return minOverlap >= 0 ? -minOverlap : maxGap;
+  }
+  if (o.type === 'sphere') {
+    const dx = o.center[0] - C[0], dy = o.center[1] - C[1], dz = o.center[2] - C[2];
+    const l = [dx * u0[0] + dy * u0[1], dx * u1[0] + dy * u1[1], dz];
+    const cx = clamp(l[0], -half[0], half[0]);
+    const cy = clamp(l[1], -half[1], half[1]);
+    const cz = clamp(l[2], -half[2], half[2]);
+    const dist = Math.hypot(l[0] - cx, l[1] - cy, l[2] - cz);
+    if (dist > 1e-12) return dist - o.radius;
+    // Sphere center is inside the box: penetration = distance to the nearest face.
+    const inside = Math.min(half[0] - Math.abs(l[0]), half[1] - Math.abs(l[1]), half[2] - Math.abs(l[2]));
+    return -(inside + o.radius);
+  }
+  if (o.type === 'cylinderZ') {
+    const dx = o.center[0] - C[0], dy = o.center[1] - C[1];
+    const l = [dx * u0[0] + dy * u0[1], dx * u1[0] + dy * u1[1]];
+    const cx = clamp(l[0], -half[0], half[0]);
+    const cy = clamp(l[1], -half[1], half[1]);
+    const dist = Math.hypot(l[0] - cx, l[1] - cy);
+    if (dist > 1e-12) return dist - o.radius;
+    const inside = Math.min(half[0] - Math.abs(l[0]), half[1] - Math.abs(l[1]));
+    return -(inside + o.radius);
+  }
+  throw new Error('unknown obstacle type ' + o.type);
+}
+
+// Clearance of the oriented vehicle box to the water-volume walls (box corners).
+export function boundsClearance(world, center, yaw, half) {
+  const [u0, u1] = yawAxes(yaw);
+  let m = Infinity;
+  for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) {
+    const p = [
+      center[0] + sx * half[0] * u0[0] + sy * half[1] * u1[0],
+      center[1] + sx * half[0] * u0[1] + sy * half[1] * u1[1],
+      center[2] + sz * half[2],
+    ];
+    const d = boundsSdf(world, p);
+    if (d < m) m = d;
+  }
+  return m;
+}
+
+// Exact obstacle clearance of the oriented vehicle at one pose. obstacle = the
+// index of the closest obstacle, or -1 for none, -2 for the water boundary.
+export function poseClearanceExact(world, center, yaw, half, margin = -Infinity) {
+  let m = Infinity, obstacle = -1;
+  const obs = world.obstacles;
+  for (let i = 0; i < obs.length; i++) {
+    const d = obstacleClearance(obs[i], center, yaw, half);
+    if (d < m) { m = d; obstacle = i; }
+  }
+  const b = boundsClearance(world, center, yaw, half);
+  if (b < m) { m = b; obstacle = -2; }
+  return { clear: m > margin, clearance: m, obstacle };
+}
+
+// Rotation-in-place check: sweep the yaw from y0 to y1 at a fixed center. Uses
+// the same conservative Lipschitz bound (arcChord/2) as translation sweeps.
+export function rotationClearance(world, center, y0, y1, half, margin = 0) {
+  const delta = Math.abs(shortestAngle(y1 - y0));
+  if (delta < 1e-9) return { clear: true, clearance: Infinity };
+  const circum = Math.hypot(half[0], half[1], half[2]);
+  const n = Math.max(1, Math.ceil((circum * delta) / ROT_STEP));
+  let worst = Infinity, obstacle = -1;
+  const dy = y1 - y0;
+  for (let i = 0; i <= n; i++) {
+    const yaw = y0 + dy * (i / n);
+    const r = poseClearanceExact(world, center, yaw, half, -Infinity);
+    if (r.clearance < worst) { worst = r.clearance; obstacle = r.obstacle; }
+    if (r.clearance <= margin) return { clear: false, clearance: r.clearance, obstacle, yaw };
+  }
+  const conservative = worst - (circum * delta / n) / 2;
+  return { clear: conservative > margin, clearance: conservative, obstacle };
+}
+
+// Translation at a CONSTANT yaw: this is exactly the pose the renderer draws for
+// a waypoint segment, so the swept verdict refers to the delivered motion rather
+// than to "the best of several orientations".
+export function sweptTranslation(world, pa, pb, yaw, half, motionStep, margin = 0) {
+  const d = dist(pa, pb);
+  const n = Math.max(1, Math.ceil(d / motionStep));
+  let worst = Infinity, worstPose = 0, obstacle = -1;
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const c = add(pa, scale(sub(pb, pa), t));
+    const r = poseClearanceExact(world, c, yaw, half, -Infinity);
+    if (r.clearance < worst) { worst = r.clearance; worstPose = i; obstacle = r.obstacle; }
+    if (r.clearance <= margin) {
+      return { clear: false, clearance: r.clearance, measured: worst, at: c, yaw, pose: i, obstacle };
+    }
+  }
+  const conservative = worst - motionStep / 2;
+  return { clear: conservative > margin, clearance: conservative, measured: worst, at: null, yaw, pose: worstPose, obstacle };
+}
+
+export const ROT_STEP = 0.3;
+
+// Signed shortest angular difference in (-pi, pi].
+export function shortestAngle(a) {
+  let x = a % (Math.PI * 2);
+  if (x <= -Math.PI) x += Math.PI * 2;
+  if (x > Math.PI) x -= Math.PI * 2;
+  return x;
+}
+
+export function angleDistance(a, b) {
+  return Math.abs(shortestAngle(a - b));
+}
+
 // Exact-ish collision of the oriented vehicle box at a single pose:
 // minimum obstacle SDF over the box surface <= margin means collision/too close.
 export function poseClearance(world, center, yaw, half, margin, stepMax) {

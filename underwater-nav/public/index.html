@@ -72,6 +72,16 @@
         <span id="speedValue">1.0×</span></label>
     </section>
 
+    <section>
+      <h2>6 · 诊断探针（沿路径回查）</h2>
+      <div class="btn-row">
+        <button id="diagnose">运行诊断探针</button>
+        <button id="showSwept">显示扫掠体</button>
+      </div>
+      <p class="desc">固定障碍只改网格原点（探针 A）或固定折线只换平滑器（探针 B），定位最早改变可达结论的体素/线段，并保存每个案例的载具朝向与扫掠体。</p>
+      <div id="diagBox" class="diag hidden"></div>
+    </section>
+
     <section id="results">
       <h2>结果区</h2>
       <div id="status" class="status idle">尚未运行</div>

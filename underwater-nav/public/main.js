@@ -342,7 +342,12 @@ function updateVehiclePose(t) {
   const a = r.samples[i], b = r.samples[Math.min(n, i + 1)];
   const p = a.map((v, d) => v + (b[d] - v[d]) * k);
   vehicleMesh.position.set(...p);
-  vehicleMesh.rotation.z = Math.atan2(b[1] - a[1], b[0] - a[0]);
+  // Draw the COMMITTED heading carried by the dense timeline (the yaw the sweep
+  // verified), never the path tangent. The old tangent-based pose could differ
+  // from the verified orientation and silently hide a collision.
+  const ya = r.sampleYaw?.[i] ?? r.laneYaw ?? 0;
+  const yb = r.sampleYaw?.[Math.min(n, i + 1)] ?? ya;
+  vehicleMesh.rotation.z = ya + (yb - ya) * k;
   // Live closest-obstacle distance from the dense verification trace.
   const traceIdx = Math.min(r.verification.trace.length - 1, Math.round(t * (r.verification.trace.length - 1)));
   const cl = r.verification.trace[traceIdx]?.clearance;
@@ -366,7 +371,8 @@ function fillMetricsOk(r) {
   const v = r.verification;
   $('metrics').innerHTML = `
     <div>路径长度：<b>${r.pathLength} m</b>（密集采样 ${r.samples.length} 点）</div>
-    <div>连续扫掠核验：<b style="color:#7ce2ad">${v.continuousSafe ? '通过' : '失败'}</b></div>
+    <div>连续扫掠核验：<b style="color:#7ce2ad">${v.continuousSafe ? '通过' : '失败'}</b>
+      · 航行朝向 ${(r.laneYaw * 180 / Math.PI).toFixed(0)}°</div>
     <div>实测最小净空：<b>${v.measuredClearance} m</b> · 保守界：${v.conservativeClearance} m</div>
     <div>朴素中心线判定：${r.naiveCenterline.clear ? '空（忽视体积）' : `碰撞 ${r.naiveCenterline.clearance} m`}</div>
     <div>A* 扩展：${r.expansions} · 扫掠否决：${r.sweptRejected}</div>
@@ -381,7 +387,99 @@ function fillMetricsFail(r) {
     <div>A* 扩展：${r.expansions ?? '-'} · 扫掠否决：${r.sweptRejected ?? '-'} · 耗时：${r.timings?.totalMs ?? '-'} ms</div>`;
 }
 
-// ---------- playback ----------
+// ---------- diagnostics ----------
+// Probe A fixes obstacles and moves only the raster origin; probe B fixes the raw
+// polyline and swaps only the smoother. Every finding carries its vehicle heading
+// and swept body, so two different-direction cases are never collapsed.
+async function runDiagnose() {
+  setStatus('busy', '正在运行诊断探针（沿路径回查）…');
+  removeVoxelTag('swept');
+  try {
+    const res = await fetch('/api/diagnose', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scenario: state.scenario.id,
+        vehicle: readVehicle(),
+        start: state.scenario.start,
+        goal: state.goal,
+      }),
+    });
+    const d = await res.json();
+    state.diagnosis = d;
+    window.__lastDiagnosis = d;
+    setStatus('ok', '诊断完成');
+    fillDiagnosis(d);
+  } catch (e) {
+    setStatus('fail', '诊断请求失败：' + e.message);
+  }
+}
+
+function fillDiagnosis(d) {
+  const box = $('diagBox');
+  box.classList.remove('hidden');
+  const attr = d.attribution;
+  const attrBadge = attr === 'rasterization' ? '<span class="tag bad">栅格化</span>'
+    : attr === 'smoothing' ? '<span class="tag bad">平滑</span>'
+    : '<span class="tag good">未发现</span>';
+  const rows = d.originShift.rows.map((r) =>
+    `<div>原点 ${r.origin.map((v) => v.toFixed(1)).join(',')} · 可达 ${r.reachable ? '<span class="good">是</span>' : '<span class="bad">否</span>'}</div>`).join('');
+  const flip = d.earliestFlip.earliest
+    ? `<div>最早翻转体素：<b>${d.earliestFlip.earliest.center.join(', ')}</b>
+        （有向格自由 / 轴对齐格阻挡，free-yaw ${d.earliestFlip.earliest.yawHintDeg ?? '任意'}°，
+        共 ${d.earliestFlip.erasedButTraversable} 个被误抹单元）</div>`
+    : '<div>未发现轴对齐栅格抹掉的体素</div>';
+  let smoother = '';
+  if (d.smootherSwap) {
+    const sm = d.smootherSwap.results.find((r) => r.name === 'lane_yaw_shortcut');
+    const raw = d.smootherSwap.results.find((r) => r.name === 'raw_astar');
+    smoother = `<div>平滑器替换：原始折线 ${raw.safe ? '安全' : '不安全'} → 平滑后 ${sm.safe ? '安全' : '<span class="bad">不安全</span>'}${
+      d.smootherSwap.earliestDivergenceSegment != null
+        ? `，最早分歧线段 #${d.smootherSwap.earliestDivergenceSegment}` : ''}</div>`;
+  }
+  const minLevel = d.minimalLevel
+    ? `<div>最小复现场景：保留 ${d.minimalLevel.keptObstacles} 个障碍，锚点 ${d.minimalLevel.anchor.join(', ')}</div>` : '';
+  box.innerHTML = `<h3>诊断结论：出错阶段 ${attrBadge}</h3>
+    <div>载具朝向：航行 <b>${d.heading.laneYawDeg}°</b>（起点 ${(d.heading.startYaw * 180 / Math.PI).toFixed(0)}°）</div>
+    <div>探针 A · 固定障碍只改网格原点：${d.originShift.flipped ? '<span class="bad">可达结论翻转</span>' : '结论不变'}</div>
+    ${rows}
+    ${flip}
+    ${smoother}
+    ${minLevel}`;
+}
+
+function showSweptBodies() {
+  if (!state.diagnosis) { setStatus('fail', '请先运行诊断探针'); return; }
+  removeVoxelTag('swept');
+  const half = readVehicle();
+  const boxes = [];
+  const d = state.diagnosis;
+  for (const r of (d.smootherSwap?.results ?? [])) {
+    for (const b of (r.sweptBody ?? [])) boxes.push(b);
+  }
+  if (d.earliestFlip?.earliest) {
+    // Draw the free-yaw oriented body at the earliest flipped voxel.
+    const e = d.earliestFlip.earliest;
+    boxes.push({
+      center: e.center,
+      yaw: ((e.yawHintDeg ?? 0) * Math.PI) / 180,
+      half: [half.length / 2, half.width / 2, half.height / 2],
+      tag: 'flip',
+    });
+  }
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffd23f, wireframe: true, transparent: true, opacity: 0.6 });
+  const geo = new THREE.BoxGeometry(1, 1, 1);
+  for (const b of boxes) {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(...b.center);
+    m.scale.set(b.half[0] * 2, b.half[1] * 2, b.half[2] * 2);
+    m.rotation.z = b.yaw;
+    m.userData.tag = 'swept';
+    voxelGroup.add(m);
+  }
+  setStatus('ok', `已绘制 ${boxes.length} 个扫掠体（按各自朝向，不合并方向）`);
+}
+
+
 function startPlayback() {
   if (!state.result?.ok) return;
   state.playing = true;
@@ -462,6 +560,8 @@ function applyClip(size) {
 
 // ---------- UI wiring ----------
 $('run').onclick = runPlan;
+$('diagnose').onclick = runDiagnose;
+$('showSwept').onclick = showSweptBodies;
 $('play').onclick = () => (state.playing ? stopPlayback() : startPlayback());
 $('stop').onclick = () => { stopPlayback(); state.playT = 0; updateVehiclePose(0); };
 $('speed').oninput = (e) => { state.speed = parseFloat(e.target.value); $('speedValue').textContent = state.speed.toFixed(1) + '×'; };
@@ -506,7 +606,7 @@ loadScenarios().then(() => {
 window.__navDebug = () => ({
   obstacleMeshes: obstacleGroup.children.filter((c) => c.isMesh).length,
   voxelInstancedMeshes: voxelGroup.children.map((c) => ({
-    tag: c.userData.tag, count: c.count,
+    tag: c.userData.tag, count: c.count ?? 1,
   })),
   pathObjects: pathGroup.children.length,
   vehicleVisible: vehicleMesh.visible,

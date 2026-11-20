@@ -1,7 +1,7 @@
 // Headless validation of the 3D navigation core. No UI involved.
 import { buildScenario, DEFAULT_DIMS } from '../src/scenarios.js';
 import { runNavigation, gridPayload } from '../src/engine.js';
-import { worldSdf, sweptBoxClearance, naiveCenterlineCheck, vehicleHalf } from '../src/geometry.js';
+import { worldSdf, sweptBoxClearance, sweptTranslation, naiveCenterlineCheck, vehicleHalf } from '../src/geometry.js';
 
 let pass = 0, fail = 0;
 function check(name, cond, detail = '') {
@@ -58,29 +58,45 @@ let slitWorld;
     r.samples.some((p) => Math.abs(p[0]) < 1.0));
 }
 
-console.log('--- Scenario 2b: widened vehicle cannot fit the slit (volume, not center) ---');
+console.log('--- Scenario 2b: fat vehicle threads the oblique slit only when aligned ---');
 {
   const fat = { length: 2.4, width: 3.2, height: 2.6 };
-  const r = runNavigation(slitWorld, fat, slitWorld.start, slitWorld.goals[0]);
-  console.log(' ', JSON.stringify(summarize(r)));
-  // The centerline down the middle of the free gap stays outside every solid
-  // regardless of vehicle size; the volumetric check is what rejects the fat
-  // vehicle whose box overlaps the slot walls.
-  // Centerline inside the gate corridor only (avoid the block end caps):
-  // the vehicle center stays in free space for ANY size, while the fat box
-  // volume still collides with the slot walls.
-  const gateLine = { a: [-3.0, 0, 8], b: [3.0, 0, 8] };
+  const href = vehicleHalf(fat);
+  // The gate line stays clear of every solid; a centerline-only check is blind to
+  // the body. The vehicle genuinely fits the ~30 deg slot, but ONLY at the slot
+  // angle: swept at the slot's own heading it clears, swept axis-aligned it hits
+  // the walls. This is the orientation-aware result the axis-aligned erosion
+  // used to erase.
+  // Corridor runs along the slot's long axis (30 deg from x); a line through the
+  // gap centre. The fat box passes only when its long axis is turned to the slot
+  // normal (yaw 120 deg ≡ -60 deg): its 2.4 m length then spans the 3.4 m gap.
+  const dir = [Math.cos(Math.PI / 6), Math.sin(Math.PI / 6)];
+  const gateLine = { a: [-4 * dir[0], -4 * dir[1], 8], b: [4 * dir[0], 4 * dir[1], 8] };
   const naive = naiveCenterlineCheck(slitWorld, gateLine.a, gateLine.b, 0.5, 0);
   check('naive centerline check wrongly reports the straight line empty',
     naive.clear === true, `naive clearance ${naive.clearance.toFixed(2)}`);
-  // The fat vehicle's swept box along that same line must be rejected.
-  const half = vehicleHalf(fat);
-  const sweep = sweptBoxClearance(slitWorld, gateLine.a, gateLine.b, half, 0.3, 0.4, 0.05);
-  check('swept box detects the fat vehicle colliding in the slit', sweep.clear === false);
-  check('fat vehicle reported unreachable with blocking volume',
-    !r.ok && r.reason === 'unreachable' && r.blocking && r.blocking.indices.length > 0);
-  check('high-res reference agrees the fat vehicle is geometrically trapped',
-    r.reference.reachable === false);
+  const slotYaw = (2 * Math.PI) / 3; // long axis across the gap
+  const aligned = sweptTranslation(slitWorld, gateLine.a, gateLine.b, slotYaw, href, 0.4, 0.05);
+  const axis = sweptTranslation(slitWorld, gateLine.a, gateLine.b, 0, href, 0.4, 0.05);
+  check('swept axis-aligned body collides in the slit', axis.clear === false,
+    `axis clearance ${axis.clearance.toFixed(3)}`);
+  check('same body threads the slit at the slot heading',
+    aligned.clear === true && aligned.clearance > 0.05,
+    `aligned clearance ${aligned.clearance.toFixed(3)}`);
+
+  const r = runNavigation(slitWorld, fat, slitWorld.start, slitWorld.goals[0]);
+  console.log(' ', JSON.stringify(summarize(r)));
+  check('planner threads the fat vehicle through the slit at an oblique lane',
+    r.ok && r.laneYaw !== 0 && r.verification.continuousSafe,
+    `ok=${r.ok} lane=${(r.laneYaw * 180 / Math.PI).toFixed(0)}`);
+  check('the delivered fat route stays clear (no false pass through the shell)',
+    r.ok && r.verification.measuredClearance > 0,
+    `measured ${r.verification && r.verification.measuredClearance}`);
+  // The conservative axis-aligned reference is a subset of true free space, so it
+  // may under-report an oblique corridor; it must never over-report one.
+  check('conservative reference does not over-report vs the oriented planner',
+    r.ok || r.reference.reachable === false,
+    `planner ok=${r.ok} ref=${r.reference.reachable}`);
 }
 
 console.log('--- Scenario 3a: sealed cavity goal is unreachable ---');
@@ -137,21 +153,33 @@ console.log('--- Eroded grid payload sanity ---');
     `${pf.indices.length} vs ${p.indices.length}`);
 }
 
-console.log('--- Grid erosion vs swept-check consistency (no phantom free space) ---');
+console.log('--- Oriented planner vs conservative reference (soundness direction) ---');
 {
-  // The axis-aligned erosion is a necessary condition for every orientation:
-  // wherever the eroded grid flood fill cannot go, the swept A* must also fail,
-  // so the planner can never claim a corridor the vehicle volume cannot use.
+  // The fine reference raster is axis-aligned, so its free set is a SUBSET of
+  // true free space: it may miss an oblique corridor (as in the fat-slit case)
+  // but must never invent one. The oriented planner therefore may reach a goal
+  // the reference calls enclosed, but a reference-reachable goal must also be
+  // planner-reachable, and every delivered route must be continuously safe.
   const fat = { length: 2.4, width: 3.2, height: 2.6 };
   for (const id of ['slit', 'wreck', 'cavity']) {
     const w = buildScenario(id);
-    const goal = id === 'cavity' ? w.goals[0] : w.goals[0];
+    const goal = w.goals[0];
     const r = runNavigation(w, fat, w.start, goal);
     const ref = r.reference;
-    check(`${id}: planner reachability never exceeds the eroded reference`,
-      r.ok === false ? ref.reachable === false : ref.reachable === true,
+    check(`${id}: reference-reachable implies planner-reachable`,
+      !ref.reachable || r.ok === true,
       `planner ok=${r.ok} ref=${ref.reachable}`);
+    check(`${id}: delivered route (if any) is continuously safe`,
+      !r.ok || r.verification.continuousSafe,
+      `ok=${r.ok}`);
   }
+  // The fat-slit corridor the conservative reference cannot see is exactly the
+  // case that used to be misclassified as trapped.
+  const slit = buildScenario('slit');
+  const rs = runNavigation(slit, fat, slit.start, slit.goals[0]);
+  check('conservative reference under-reports the oblique fat-slit corridor',
+    rs.ok === true && rs.reference.reachable === false,
+    `planner ok=${rs.ok} ref=${rs.reference.reachable}`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

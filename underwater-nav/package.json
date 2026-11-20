@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/selftest.js"
+    "test": "node test/selftest.js && node test/diagtest.js",
+    "test:ui": "node test/ui-test.js"
   },
   "dependencies": {
     "three": "0.160.0"

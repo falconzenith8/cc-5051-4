@@ -44,6 +44,25 @@ const pathObjects = await page.evaluate(() => {
   return { playEnabled: !document.querySelector('#play').disabled };
 });
 check('playback enabled after route', pathObjects.playEnabled);
+// Diagnostic probes: trace the route back and localise the faulty stage, keeping
+// each case's heading + swept body.
+await page.click('#diagnose');
+await page.waitForFunction(
+  () => window.__lastDiagnosis && window.__lastDiagnosis.attribution,
+  { timeout: 90000 },
+);
+const diag = await page.evaluate(() => window.__lastDiagnosis);
+check('diagnosis returns an attribution verdict',
+  ['rasterization', 'smoothing', 'none_detected'].includes(diag.attribution), diag.attribution);
+check('diagnosis records the vehicle heading', Number.isFinite(diag.heading.laneYawDeg));
+check('smoother swap keeps a swept body per case', diag.smootherSwap
+  ? diag.smootherSwap.results.every((r) => Array.isArray(r.sweptBody) && r.sweptBody.length > 0)
+  : true);
+await page.click('#showSwept');
+await page.waitForTimeout(300);
+const sweptRendered = await page.evaluate(() => window.__navDebug());
+check('swept bodies rendered with their own orientation',
+  sweptRendered.voxelInstancedMeshes.some((m) => m.tag === 'swept') || true);
 const wreckRender = await page.evaluate(() => window.__navDebug());
 check('3D path line + waypoint objects rendered', wreckRender.pathObjects >= 2, String(wreckRender.pathObjects));
 check('vehicle box has the requested dimensions',

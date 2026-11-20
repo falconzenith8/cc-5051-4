@@ -1,9 +1,25 @@
-// True 3D A* over the eroded voxel configuration space. Vertical and diagonal
-// moves are first-class: all 26 neighbours are expanded with Euclidean costs,
-// so routes can climb, dive and weave instead of following a height-tagged
-// horizontal map. Every expanded edge is additionally re-checked with the
-// conservative swept box test against the full analytic vehicle geometry.
-import { dist, sweptBoxClearance, vehicleHalf, worldSdf, add, sub, scale } from './geometry.js';
+// True 3D A* over the orientation-aware voxel configuration space. Vertical and
+// diagonal moves are first-class: all 26 neighbours are expanded with Euclidean
+// costs, so routes can climb, dive and weave instead of following a height-tagged
+// horizontal map.
+//
+// MOTION MODEL — "yaw lane". A submersible holds a heading and thrusts in any
+// direction (crabbing). We therefore plan one A* per candidate heading ("lane"):
+// the vehicle rotates in place at the start to the lane yaw (verified), then
+// translates through every hop at that CONSTANT yaw, exactly the pose the
+// renderer draws. This is why an oblique slot is threadable at its own angle
+// while the gate is crossed along x, and why a wide vehicle can pass a hallway
+// broadside (lane 90°). The first lane that reaches the goal wins; the lowest
+// lane that fits is usually the most natural heading.
+//
+// Correctness: every expanded edge is re-checked with the exact oriented-box
+// swept translation at the SAME margin the final verification uses, so a lane
+// the search accepts is a lane the verifier accepts — the delivered route can
+// never be one the collision model rejects.
+import {
+  dist, vehicleHalf, sweptTranslation, rotationClearance, poseClearanceExact,
+  angleDistance, heading, worldSdf,
+} from './geometry.js';
 
 class MinHeap {
   constructor() { this.a = []; }
@@ -40,32 +56,31 @@ class MinHeap {
   }
 }
 
-export function planPath(grid, world, startIdx, goalIdx, dims, opts = {}) {
-  const half = vehicleHalf(dims);
-  const surfaceStep = opts.surfaceStep ?? grid.cell * 1.0;
-  const motionStep = opts.motionStep ?? grid.cell * 1.0;
-  const maxExpansions = opts.maxExpansions ?? 400000;
+// Candidate headings, 30° apart. The vehicle box is symmetric under a 180° yaw,
+// so θ and θ+180° are the same pose; we normalise every lane to its
+// representative in (-90°, 90°] and include 0 (aligned with x) and ±60/±30/90.
+export const LANE_YAWS = Array.from({ length: 12 }, (_, i) => {
+  let y = (i * Math.PI) / 6;
+  // fold into (-pi/2, pi/2]
+  while (y <= -Math.PI / 2) y += Math.PI;
+  while (y > Math.PI / 2) y -= Math.PI;
+  return y;
+})
 
+// Plan a single-lane route at a fixed heading. Returns null if this lane cannot
+// reach the goal. Edges are verified with the exact swept translation at `yaw`.
+function planLane(grid, world, dims, startIdx, goalIdx, yaw, motionStep, safeMargin, maxExpansions) {
+  const half = vehicleHalf(dims);
   const goal = grid.centerOf(goalIdx);
   const gScore = new Float64Array(grid.n).fill(Infinity);
   const came = new Int32Array(grid.n).fill(-1);
   const closed = new Uint8Array(grid.n);
   const heap = new MinHeap();
-
-  gScore[startIdx] = 0;
-  heap.push({ idx: startIdx, f: dist(grid.centerOf(startIdx), goal) });
-
-  // Lazy edge validation: the swept test runs when an edge is first made
-  // permanent (on pop), not once per neighbour relaxation. Results are cached
-  // per undirected edge, so each physical motion is evaluated at most once.
   const edgeCache = new Map();
   const edgeKey = (a, b) => (a < b ? a * grid.n + b : b * grid.n + a);
-  // SDF values at voxel centers are precomputed in the grid; midpoints of
-  // voxel hops land on half-integer offsets and are memoized here.
-  const midSdfCache = new Map();
-  const endSdf = (idx) => grid.clearance[idx];
-  const inRadius = Math.min(half[0], half[1], half[2]);
+
   const circum = Math.hypot(half[0], half[1], half[2]);
+  const inRadius = Math.min(half[0], half[1], half[2]);
   let expansions = 0;
   let sweptRejected = 0;
   let fastAccepted = 0;
@@ -75,52 +90,37 @@ export function planPath(grid, world, startIdx, goalIdx, dims, opts = {}) {
     const cached = edgeCache.get(key);
     if (cached !== undefined) return cached;
     const ca = grid.centerOf(aIdx), cb = grid.centerOf(bIdx);
-    let midS = midSdfCache.get(key);
-    if (midS === undefined) {
-      const mid = add(ca, scale(sub(cb, ca), 0.5));
-      midS = worldSdf(world, mid);
-      midSdfCache.set(key, midS);
-    }
-    // Necessary-condition reject: even the inscribed sphere does not fit.
+    const mid = [(ca[0] + cb[0]) / 2, (ca[1] + cb[1]) / 2, (ca[2] + cb[2]) / 2];
+    const midS = worldSdf(world, mid);
     if (midS < inRadius + grid.margin) {
       edgeCache.set(key, false);
       sweptRejected++;
       return false;
     }
-    // Sufficient-condition accept: the circumscribed sphere fits at both
-    // ends and the midpoint, so every box corner stays clear throughout the
-    // hop — skip the expensive surface sweep in open water.
-    if (endSdf(aIdx) > circum + grid.margin
-      && endSdf(bIdx) > circum + grid.margin
+    if (grid.clearance[aIdx] > circum + grid.margin
+      && grid.clearance[bIdx] > circum + grid.margin
       && midS > circum + grid.margin) {
       edgeCache.set(key, true);
       fastAccepted++;
       return true;
     }
-    // Near-obstacle region: authoritative oriented swept box test.
-    const res = sweptBoxClearance(
-      world, ca, cb, half, surfaceStep, motionStep, grid.margin,
-    );
+    const res = sweptTranslation(world, ca, cb, yaw, half, motionStep, safeMargin);
     edgeCache.set(key, res.clear);
     if (!res.clear) sweptRejected++;
     return res.clear;
   };
 
+  gScore[startIdx] = 0;
+  heap.push({ idx: startIdx, f: dist(grid.centerOf(startIdx), goal) });
   let found = false;
   while (heap.size) {
     const { idx } = heap.pop();
     if (closed[idx]) continue;
     if (idx !== startIdx && came[idx] === -1) continue;
-    if (idx !== startIdx && !edgeSafe(came[idx], idx)) {
-      // Parent motion is physically infeasible. The edge is cached false, but
-      // the voxel stays open: keep its g-score so another safe parent can
-      // re-relax it, and do not mark it closed.
-      continue;
-    }
+    if (idx !== startIdx && !edgeSafe(came[idx], idx)) continue;
     if (idx === goalIdx) { found = true; break; }
     closed[idx] = 1;
     if (++expansions > maxExpansions) break;
-
     for (const [nb, step] of grid.neighbors(idx)) {
       if (closed[nb]) continue;
       const tentative = gScore[idx] + step;
@@ -131,52 +131,81 @@ export function planPath(grid, world, startIdx, goalIdx, dims, opts = {}) {
       }
     }
   }
-
   if (!found) {
-    return {
-      ok: false, reason: 'unreachable',
-      expansions, sweptRejected, fastAccepted,
-      reached: reachedFromCame(grid, came, startIdx, closed),
-    };
+    return { ok: false, expansions, sweptRejected, fastAccepted };
   }
-
   const idxPath = [];
   let cur = goalIdx;
   while (cur !== -1) { idxPath.push(cur); cur = came[cur]; }
   idxPath.reverse();
-  const path = idxPath.map((idx) => grid.centerOf(idx));
-  return { ok: true, path, idxPath, expansions, sweptRejected, fastAccepted };
+  return {
+    ok: true, yaw, idxPath, path: idxPath.map((idx) => grid.centerOf(idx)),
+    expansions, sweptRejected, fastAccepted,
+  };
 }
 
-// Reconstruct the reached free component after a failed search: every voxel
-// that got a finite g-score is part of the connected, swept-checked component.
-function reachedFromCame(grid, came, startIdx) {
-  const reached = new Uint8Array(grid.n);
-  const stack = [startIdx];
-  reached[startIdx] = 1;
-  while (stack.length) {
-    const idx = stack.pop();
-    for (const [nb] of grid.neighbors(idx)) {
-      if (!reached[nb] && (came[nb] !== -1 || nb === startIdx)) {
-        reached[nb] = 1;
-        stack.push(nb);
-      }
+export function planPath(grid, world, startIdx, goalIdx, dims, opts = {}) {
+  const motionStep = opts.motionStep ?? grid.cell;
+  // SAFE is the guaranteed continuous clearance certified by the sweep; the grid
+  // is built at SAFE + motionStep/2 so a free pose clears the sweep's demand.
+  const safeMargin = opts.safeMargin ?? Math.max(0, grid.margin - motionStep / 2);
+  const maxExpansions = opts.maxExpansions ?? 400000;
+  const half = vehicleHalf(dims);
+  const startCenter = grid.centerOf(startIdx);
+
+  // Lanes to try, in order of rotation cost from the vehicle's initial heading
+  // (0 = long axis along +x). A lane whose in-place rotation at the start is
+  // blocked is skipped outright.
+  const startYaw = opts.startYaw ?? 0;
+  // De-duplicate the folded lanes, then order by rotation cost from the start.
+  const uniq = [];
+  for (const y of (opts.lanes ?? LANE_YAWS)) {
+    if (!uniq.some((u) => angleDistance(u, y) < 1e-6)) uniq.push(y);
+  }
+  const lanes = uniq.sort((a, b) => angleDistance(a, startYaw) - angleDistance(b, startYaw));
+
+  let agg = { expansions: 0, sweptRejected: 0, fastAccepted: 0 };
+  const attempts = [];
+  for (const yaw of lanes) {
+    const rot = rotationClearance(world, startCenter, startYaw, yaw, half, safeMargin);
+    if (!rot.clear) { attempts.push({ yaw, skip: 'rotate_blocked' }); continue; }
+    const res = planLane(grid, world, dims, startIdx, goalIdx, yaw, motionStep, safeMargin, maxExpansions);
+    agg.expansions += res.expansions;
+    agg.sweptRejected += res.sweptRejected;
+    agg.fastAccepted += res.fastAccepted;
+    attempts.push({ yaw, ok: res.ok, expansions: res.expansions });
+    if (res.ok) {
+      return {
+        ...res,
+        startYaw,
+        laneYaw: yaw,
+        startRotateClear: rot.clearance,
+        attempts,
+        ...agg,
+      };
     }
   }
-  return reached;
+
+  // No lane reached the goal: report the failure with the reached component of
+  // the lane that got furthest is not meaningful across lanes, so use the grid
+  // flood fill (conservative) for the blocking display.
+  return { ok: false, reason: 'unreachable', attempts, ...agg };
 }
 
-// Line-of-sight shortcutting on the voxel path using the same conservative
-// swept check, then a final dense resample so the delivered route is smooth.
-// Shortcuts may only remove waypoints; they never relax the safety criterion.
+// Shortcutting that keeps the committed lane yaw. A chord is accepted only when
+// the vehicle, held at the lane yaw, sweeps it clear — the pose the renderer
+// draws. Shortcuts only remove waypoints; the safety criterion never relaxes.
+//
+// The dense timeline carries the yaw per sample so verification and playback use
+// exactly the same orientation.
 export function smoothPath(grid, world, path, dims, opts = {}) {
   const half = vehicleHalf(dims);
-  const surfaceStep = opts.surfaceStep ?? grid.cell * 1.0;
-  const motionStep = opts.motionStep ?? grid.cell * 1.0;
+  const motionStep = opts.motionStep ?? grid.cell;
+  const safeMargin = opts.safeMargin ?? Math.max(0, grid.margin - motionStep / 2);
+  const yaw = opts.laneYaw ?? opts.yaws?.[0] ?? 0;
+  const startYaw = opts.startYaw ?? 0;
 
-  const safe = (a, b) => sweptBoxClearance(
-    world, a, b, half, surfaceStep, motionStep, grid.margin,
-  );
+  const safe = (a, b) => sweptTranslation(world, a, b, yaw, half, motionStep, safeMargin);
 
   let waypoints = path.slice();
   let changed = true;
@@ -198,7 +227,17 @@ export function smoothPath(grid, world, path, dims, opts = {}) {
     waypoints = out;
   }
 
-  // Dense, uniform resample of the smoothed polyline for playback + verification.
+  // Dense timeline: in-place rotation at the first waypoint (start heading ->
+  // lane yaw), then constant-yaw translation along each leg.
+  const samples = [];
+  const sampleYaw = [];
+  const push = (p, y) => { samples.push(p.slice()); sampleYaw.push(y); };
+  push(waypoints[0], startYaw);
+  const rotDelta = yaw - startYaw;
+  if (Math.abs(rotDelta) > 1e-9) {
+    const nr = Math.max(1, Math.ceil(Math.abs(rotDelta) / (Math.PI / 24)));
+    for (let k = 1; k <= nr; k++) push(waypoints[0], startYaw + rotDelta * (k / nr));
+  }
   const segLen = [];
   let total = 0;
   for (let i = 0; i < waypoints.length - 1; i++) {
@@ -206,20 +245,21 @@ export function smoothPath(grid, world, path, dims, opts = {}) {
     segLen.push(l);
     total += l;
   }
-  const samples = [];
   const samplesN = Math.max(waypoints.length, Math.ceil(total / (motionStep * 0.9)));
   for (let s = 0; s <= samplesN; s++) {
     const target = (s / samplesN) * total;
     let acc = 0, seg = 0;
     while (seg < segLen.length && acc + segLen[seg] < target) { acc += segLen[seg]; seg++; }
-    if (seg >= segLen.length) { samples.push(waypoints[waypoints.length - 1]); continue; }
+    if (seg >= segLen.length) { push(waypoints[waypoints.length - 1], yaw); continue; }
     const t = segLen[seg] === 0 ? 0 : (target - acc) / segLen[seg];
     const a = waypoints[seg], b = waypoints[seg + 1];
-    samples.push([
+    push([
       a[0] + (b[0] - a[0]) * t,
       a[1] + (b[1] - a[1]) * t,
       a[2] + (b[2] - a[2]) * t,
-    ]);
+    ], yaw);
   }
-  return { waypoints, samples };
+  return { waypoints, waypointYaw: waypoints.map(() => yaw), samples, sampleYaw, laneYaw: yaw };
 }
+
+export { poseClearanceExact };

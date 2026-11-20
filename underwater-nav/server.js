@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildScenario, DEFAULT_DIMS, scenarioIds } from './src/scenarios.js';
 import { runNavigation, gridPayload } from './src/engine.js';
+import { diagnose } from './src/diagnose.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
@@ -81,6 +82,20 @@ const server = http.createServer(async (req, res) => {
       const world = buildScenario(body.scenario);
       const result = runNavigation(world, dims, body.start, body.goal, { margin: body.margin ?? 0.05 });
       return sendJson(res, 200, result);
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/diagnose') {
+      const body = await readBody(req);
+      if (!scenarioIds().includes(body.scenario)) return sendJson(res, 400, { error: 'unknown scenario' });
+      const dims = { ...DEFAULT_DIMS, ...(body.vehicle || {}) };
+      const world = buildScenario(body.scenario);
+      const start = validPoint(body.start) ? body.start : world.start;
+      const goal = validPoint(body.goal) ? body.goal : world.goals[0];
+      const report = diagnose(world, dims, start, goal, {
+        startYaw: Number.isFinite(body.startYaw) ? body.startYaw : 0,
+        axes: Array.isArray(body.axes) ? body.axes : [0, 1],
+      });
+      return sendJson(res, 200, report);
     }
 
     if (req.method === 'GET') {

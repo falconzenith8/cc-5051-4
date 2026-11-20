@@ -160,7 +160,60 @@ function cavityScenario() {
   };
 }
 
-const BUILDERS = { wreck: wreckScenario, slit: slitScenario, cavity: cavityScenario };
+// 4) MIRRORED / ROTATED HOLE: the same oblique slit copied to the opposite
+//    direction of the map and turned a further 90 degrees (30° -> 120°). The
+//    gap width, block thickness and vehicle are identical to scenario 2, so the
+//    passability physics is the same — but the failure heading is different.
+//    Recording each case with its own committed lane yaw and swept body is what
+//    keeps the two directions distinguishable; a single voxel screenshot would
+//    collapse them and lose the evidence basis. Start/goal are biased toward the
+//    +n slot wall so the delivered route hugs the obstacle while staying legal.
+function slitMirrorScenario() {
+  const obstacles = [];
+  const rng = makeRng(77002);
+  const yaw = Math.PI / 6 + Math.PI / 2; // 120 degrees
+  const u = [Math.cos(yaw), Math.sin(yaw)]; // corridor (slot long axis)
+  const n = [-Math.sin(yaw), Math.cos(yaw)]; // gap normal
+
+  // Same gap (3.4 m) and thickness as scenario 2, but the block LENGTH is
+  // shortened so the rotated axis still fits the map and both vehicles keep a
+  // legal detour. Physics of the slot itself is unchanged.
+  const halfBlock = [6.0, 3.4, 7.0];
+  const gap = 3.4;
+  const off = halfBlock[1] + gap / 2;
+  obstacles.push(box([n[0] * off, n[1] * off, 8], halfBlock, yaw));
+  obstacles.push(box([-n[0] * off, -n[1] * off, 8], halfBlock, yaw));
+
+  // Same capping slabs as scenario 2: vertical escape is sealed near the slot.
+  obstacles.push(box([0, 0, 15.4], [9.0, 9.0, 0.6]));
+  obstacles.push(box([0, 0, 0.6], [9.0, 9.0, 0.6]));
+
+  for (let i = 0; i < 5; i++) {
+    const side = rng() < 0.5 ? -1 : 1;
+    const x = side * (10 + rng() * 3.5);
+    const y = -8 + rng() * 16;
+    const z = 1.5 + rng() * 5;
+    obstacles.push(sphere([x, y, z], 0.8 + rng() * 0.9));
+  }
+
+  // Bias 0.5 m toward the +n wall: the legal route skims that side (min surface
+  // clearance ~0.20 m) instead of running down the middle.
+  const bias = 0.5, reach = 9;
+  const start = [-u[0] * reach + n[0] * bias, -u[1] * reach + n[1] * bias, 8];
+  const goal = [u[0] * reach + n[0] * bias, u[1] * reach + n[1] * bias, 8];
+
+  return {
+    id: 'slitMirror',
+    name: '镜像斜孔：复制到另一方向并旋转 90°',
+    description: '把 30° 斜缝复制到地图另一方向并再旋转 90°（120°）。缝宽与载具与场景二一致，通过性物理相同，但失败朝向不同——每个案例分别保存载具朝向与扫掠体，不会把两个方向不同的案例压缩成同一体素截图。起点/目标偏向 +n 侧缝壁，成功轨迹紧贴障碍但始终合法。',
+    bounds: BOUNDS,
+    obstacles,
+    start,
+    goals: [goal],
+  };
+}
+
+const BUILDERS = { wreck: wreckScenario, slit: slitScenario, cavity: cavityScenario, slitMirror: slitMirrorScenario };
 
 export function buildScenario(id) {
   const b = BUILDERS[id];

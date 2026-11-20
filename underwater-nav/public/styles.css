@@ -46,6 +46,12 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 #metrics b { color: #fff; font-weight: 600; }
 .failure { margin-top: 8px; background: #2a1018; border: 1px solid #6e2438; border-radius: 6px; padding: 9px 11px; font-size: 12px; line-height: 1.6; }
 .failure h3 { margin: 0 0 6px; font-size: 13px; color: #ff8fa3; }
+.diag { margin-top: 8px; background: #101f2c; border: 1px solid #2b5570; border-radius: 6px; padding: 9px 11px; font-size: 12px; font-family: ui-monospace, monospace; line-height: 1.6; color: #b7d0e6; }
+.diag h3 { margin: 0 0 6px; font-size: 13px; color: #8fd3ff; }
+.diag b { color: #fff; font-weight: 600; }
+.diag .tag { display: inline-block; padding: 0 5px; border-radius: 3px; background: #24455e; color: #cfe8ff; }
+.diag .bad { color: #ff9dad; }
+.diag .good { color: #7ce2ad; }
 .hidden { display: none; }
 
 .legend { margin-top: 12px; display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: #9db4c9; }
